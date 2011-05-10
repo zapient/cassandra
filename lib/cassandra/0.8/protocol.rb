@@ -90,7 +90,7 @@ class Cassandra
                   else
                     CassandraThrift::SlicePredicate.new(:slice_range => 
                       CassandraThrift::SliceRange.new(
-                        :start  => start, 
+                        :start => start, 
                         :finish => finish,
                         :count  => count))
                   end

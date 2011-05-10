@@ -1,5 +1,3 @@
-require 'nokogiri'
-
 class SimpleUUID::UUID
   def >=(other)
     (self <=> other) >= 0
@@ -15,11 +13,13 @@ class Cassandra
     include ::Cassandra::Helpers
     include ::Cassandra::Columns
 
-    def initialize(keyspace, storage_xml)
+    def initialize(keyspace, schema)
+      @is_super = {}
       @keyspace = keyspace
       @column_name_class = {}
       @sub_column_name_class = {}
-      @storage_xml = storage_xml
+      @indexes = {}
+      @schema = schema[keyspace]
       clear_keyspace!
     end
 
@@ -39,7 +39,7 @@ class Cassandra
         @batch << [:insert, column_family, key, hash_or_array, options]
       else
         raise ArgumentError if key.nil?
-        if column_family_type(column_family) == 'Standard'
+        if !is_super(column_family)
           insert_standard(column_family, key, hash_or_array)
         else
           insert_super(column_family, key, hash_or_array)
@@ -77,7 +77,7 @@ class Cassandra
     def get(column_family, key, *columns_and_options)
       column_family, column, sub_column, options =
         extract_and_validate_params_for_real(column_family, [key], columns_and_options, READ_DEFAULTS)
-      if column_family_type(column_family) == 'Standard'
+      if !is_super(column_family)
         get_standard(column_family, key, column, options)
       else
         get_super(column_family, key, column, sub_column, options)
@@ -85,7 +85,9 @@ class Cassandra
     end
 
     def get_standard(column_family, key, column, options)
-      row = cf(column_family)[key] || OrderedHash.new
+      columns = cf(column_family)[key] || OrderedHash.new
+      row = columns_to_hash(column_family, columns)
+
       if column
         row[column]
       else
@@ -95,26 +97,24 @@ class Cassandra
     end
 
     def get_super(column_family, key, column, sub_column, options)
+      columns = cf(column_family)[key] || OrderedHash.new
+      row = columns_to_hash(column_family, columns)
+
       if column
         if sub_column
-          if cf(column_family)[key] &&
-             cf(column_family)[key][column] &&
-             cf(column_family)[key][column][sub_column]
-            cf(column_family)[key][column][sub_column]
+          if row[column] &&
+            row[column][sub_column]
+            row[column][sub_column]
           else
             nil
           end
         else
-          row = cf(column_family)[key] && cf(column_family)[key][column] ?
-            cf(column_family)[key][column] :
-            OrderedHash.new
+          row = row[column] || OrderedHash.new
           row = apply_range(row, column_family, options[:start], options[:finish], false)
           apply_count(row, options[:count], options[:reversed])
         end
-      elsif cf(column_family)[key]
-        cf(column_family)[key]
       else
-        OrderedHash.new
+        row
       end
     end
 
@@ -137,9 +137,9 @@ class Cassandra
       else
         if column
           if sub_column
-            cf(column_family)[key][column].delete(sub_column)
+            cf(column_family)[key][column].delete(sub_column.to_s)
           else
-            cf(column_family)[key].delete(column)
+            cf(column_family)[key].delete(column.to_s)
           end
         else
           cf(column_family).delete(key)
@@ -150,7 +150,6 @@ class Cassandra
     def get_columns(column_family, key, *columns_and_options)
       column_family, columns, sub_columns, options = extract_and_validate_params_for_real(column_family, key, columns_and_options, READ_DEFAULTS)
       d = get(column_family, key)
-
 
       if sub_columns
         sub_columns.collect do |sub_column|
@@ -182,66 +181,142 @@ class Cassandra
     end
 
     def get_range(column_family, options = {})
-      column_family, _, _, options = extract_and_validate_params_for_real(column_family, "", [options], READ_DEFAULTS)
-      _get_range(column_family, options[:start], options[:finish], options[:count]).keys
+      column_family, _, _, options = extract_and_validate_params_for_real(column_family, "", [options], 
+                                                                          READ_DEFAULTS.merge(:start_key  => '',
+                                                                                              :end_key    => '',
+                                                                                              :key_count  => 100,
+                                                                                              :columns    => nil
+                                                                                             )
+                                                                         )
+      _get_range(column_family,
+                 options[:start_key],
+                 options[:finish_key],
+                 options[:key_count],
+                 options[:columns],
+                 options[:start],
+                 options[:finish],
+                 options[:count],
+                 options[:consistency])
     end
 
-    def count_range(column_family, options={})
-      count = 0
-      l = []
-      start_key = ''
-      while (l = get_range(column_family, options.merge(:count => 1000, :start => start_key))).size > 0
-        count += l.size
-        start_key = l.last.succ
+    def get_range_keys(column_family, options = {})
+      get_range(column_family,options.merge!(:columns => [])).keys
+    end
+
+    def count_range(column_family, options = {})
+      get_range(column_family, options).select{|k,v| v.length > 0}.keys.compact.length
+    end
+
+    def each_key(column_family, options = {})
+      each(column_family, options.merge!(:columns => [])) do |key, value|
+        yield key
       end
-      count
+    end
+
+    def each(column_family, options = {})
+      batch_size    = options.delete(:batch_size) || 100
+      count         = options.delete(:key_count)
+      yielded_count = 0
+
+      options[:start_key] ||= ''
+      last_key  = nil
+
+      while options[:start_key] != last_key && (count.nil? || count > yielded_count)
+        options[:start_key] = last_key
+        res = get_range(column_family, options.merge!(:start_key => last_key, :key_count => batch_size))
+        res.each do |key, columns|
+          next if options[:start_key] == key
+          next if yielded_count == count
+          yield key, columns
+          yielded_count += 1
+          last_key = key
+        end
+      end
+    end
+
+    def create_index(ks_name, cf_name, c_name, v_class)
+      if @indexes[ks_name] &&
+        @indexes[ks_name][cf_name] &&
+        @indexes[ks_name][cf_name][c_name] 
+        nil
+
+      else
+        @indexes[ks_name] ||= {}
+        @indexes[ks_name][cf_name] ||= {}
+        @indexes[ks_name][cf_name][c_name] = true
+      end
+    end
+
+    def drop_index(ks_name, cf_name, c_name)
+      if @indexes[ks_name] &&
+        @indexes[ks_name][cf_name] &&
+        @indexes[ks_name][cf_name][c_name] 
+
+        @indexes[ks_name][cf_name].delete(c_name)
+      else
+        nil
+      end
+    end
+
+    def create_idx_expr(c_name, value, op)
+      {:column_name => c_name, :value => value, :comparison => op}
+    end
+
+    def create_idx_clause(idx_expressions, start = "")
+      {:start => start, :index_expressions => idx_expressions}
+    end
+
+    def get_indexed_slices(column_family, idx_clause, *columns_and_options)
+      column_family, columns, _, options =
+        extract_and_validate_params_for_real(column_family, [], columns_and_options, READ_DEFAULTS)
+
+      ret = {}
+      cf(column_family).each do |key, row|
+        next if idx_clause[:start] != '' && key < idx_clause[:start]
+
+        matches = []
+        idx_clause[:index_expressions].each do |expr|
+          next if row[expr[:column_name]].nil?
+          next unless row[expr[:column_name]].send(expr[:comparison].to_sym, expr[:value])
+
+          matches << expr
+        end
+
+        ret[key] = row if matches.length == idx_clause[:index_expressions].length
+      end
+
+      ret
     end
 
     def schema(load=true)
-      if !load && !@schema
-        []
-      else
-        @schema ||= schema_for_keyspace(@keyspace)
-      end
+      @schema
+    end
+
+    def column_family_property(column_family, key)
+      schema[column_family.to_s][key]
     end
 
     private
 
-    def _get_range(column_family, start, finish, count)
+    def schema_for_keyspace(keyspace)
+      @schema
+    end
+
+    def _get_range(column_family, start_key, finish_key, key_count, columns, start, finish, count, consistency)
       ret = OrderedHash.new
       start  = to_compare_with_type(start,  column_family)
       finish = to_compare_with_type(finish, column_family)
       cf(column_family).keys.sort.each do |key|
-        break if ret.keys.size >= count
-        if (start.nil? || key >= start) && (finish.nil? || key <= finish)
-          ret[key] = cf(column_family)[key]
+        break if ret.keys.size >= key_count
+        if (start_key.nil? || key >= start_key) && (finish_key.nil? || key <= finish_key)
+          if columns
+            ret[key] = columns.inject(OrderedHash.new){|hash, column_name| hash[column_name] = cf(column_family)[key][column_name]; hash;}
+          else
+            ret[key] = apply_range(cf(column_family)[key], column_family, start, finish, !is_super(column_family))
+          end
         end
       end
       ret
-    end
-
-    def schema_for_keyspace(keyspace)
-      doc = read_storage_xml
-      ret = {}
-      doc.css("Keyspaces Keyspace[@Name='#{keyspace}']").css('ColumnFamily').each do |cf|
-        ret[cf['Name']] = {}
-        if cf['CompareSubcolumnsWith']
-          ret[cf['Name']]['CompareSubcolumnsWith'] = 'org.apache.cassandra.db.marshal.' + cf['CompareSubcolumnsWith']
-        end
-        if cf['CompareWith']
-          ret[cf['Name']]['CompareWith'] = 'org.apache.cassandra.db.marshal.' + cf['CompareWith']
-        end
-        if cf['ColumnType'] == 'Super'
-          ret[cf['Name']]['Type'] = 'Super'
-        else
-          ret[cf['Name']]['Type'] = 'Standard'
-        end
-      end
-      ret
-    end
-
-    def read_storage_xml
-      @doc ||= Nokogiri::XML(open(@storage_xml))
     end
 
     def extract_and_validate_params_for_real(column_family, keys, args, options)
@@ -264,25 +339,12 @@ class Cassandra
     def to_compare_with_type(column_name, column_family, standard=true)
       return column_name if column_name.nil?
       klass = if standard
-        schema[column_family.to_s]["CompareWith"]
+        column_name_class(column_family)
       else
-        schema[column_family.to_s]["CompareSubcolumnsWith"]
+        sub_column_name_class(column_family)
       end
 
-      case klass
-      when "org.apache.cassandra.db.marshal.UTF8Type", "org.apache.cassandra.db.marshal.BytesType"
-        column_name
-      when "org.apache.cassandra.db.marshal.TimeUUIDType"
-        SimpleUUID::UUID.new(column_name)
-      when "org.apache.cassandra.db.marshal.LongType"
-        Long.new(column_name)
-      else
-        raise "Unknown column family type: #{klass.inspect}"
-      end
-    end
-
-    def column_family_type(column_family)
-      schema[column_family.to_s]['Type']
+      klass.new(column_name)
     end
 
     def cf(column_family)
@@ -293,7 +355,30 @@ class Cassandra
       if new_stuff.is_a?(Array)
         new_stuff = new_stuff.inject({}){|h,k| h[k] = nil; h }
       end
+
+      new_stuff = new_stuff.to_a.inject({}){|h,k| h[k[0].to_s] = k[1]; h }
+
       OrderedHash[old_stuff.merge(new_stuff).sort{|a,b| a[0] <=> b[0]}]
+    end
+
+    def columns_to_hash(column_family, columns)
+      column_class, sub_column_class = column_name_class(column_family), sub_column_name_class(column_family)
+      output = OrderedHash.new
+
+      columns.each do |column_name, value|
+        column = column_class.new(column_name)
+
+        if [Hash, OrderedHash].include?(value.class)
+          output[column] ||= OrderedHash.new
+          value.each do |sub_column, sub_column_value|
+            output[column][sub_column_class.new(sub_column)] = sub_column_value
+          end
+        else
+          output[column_class.new(column_name)] = value
+        end
+      end
+
+      output
     end
 
     def apply_count(row, count, reversed=false)

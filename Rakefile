@@ -1,3 +1,5 @@
+require 'fileutils'
+
 unless ENV['FROM_BIN_CASSANDRA_HELPER']
   require 'rubygems'
   require 'echoe'
@@ -13,43 +15,64 @@ unless ENV['FROM_BIN_CASSANDRA_HELPER']
   end
 end
 
+CassandraBinaries = {
+  '0.6' => 'http://www.apache.org/dist/cassandra/0.6.13/apache-cassandra-0.6.13-bin.tar.gz',
+  '0.7' => 'http://www.apache.org/dist/cassandra/0.7.5/apache-cassandra-0.7.5-bin.tar.gz',
+  '0.8' => 'http://www.apache.org/dist/cassandra/0.8.0/apache-cassandra-0.8.0-beta1-bin.tar.gz'
+}
+
 CASSANDRA_HOME = ENV['CASSANDRA_HOME'] || "#{ENV['HOME']}/cassandra"
-DOWNLOAD_DIR = "/tmp"
-DIST_URL = "http://www.fightrice.com/mirrors/apache/cassandra/0.6.12/apache-cassandra-0.6.12-bin.tar.gz"
-DIST_FILE = DIST_URL.split('/').last
+CASSANDRA_VERSION = ENV['CASSANDRA_VERSION'] || '0.7'
 
-directory CASSANDRA_HOME
-directory File.join(CASSANDRA_HOME, 'test', 'data')
+def setup_cassandra_version(version = CASSANDRA_VERSION)
+  FileUtils.mkdir_p CASSANDRA_HOME
 
-desc "Start Cassandra"
-task :cassandra => [:java, File.join(CASSANDRA_HOME, 'server'), File.join(CASSANDRA_HOME, 'test', 'data')] do
+  destination_directory = File.join(CASSANDRA_HOME, 'cassandra-' + CASSANDRA_VERSION)
+
+  unless File.exists?(File.join(destination_directory, 'bin','cassandra'))
+    download_source       = CassandraBinaries[CASSANDRA_VERSION]
+    download_destination  = File.join("/tmp", File.basename(download_source))
+    untar_directory       = File.join(CASSANDRA_HOME,  File.basename(download_source,'-bin.tar.gz'))
+
+    puts "downloading cassandra"
+    sh "curl -L -o #{download_destination} #{download_source}"
+
+    sh "tar xzf #{download_destination} -C #{CASSANDRA_HOME}"
+    sh "mv #{untar_directory} #{destination_directory}"
+  end
+end
+
+def setup_environment
   env = ""
   if !ENV["CASSANDRA_INCLUDE"]
-    env << "CASSANDRA_INCLUDE=#{File.expand_path(Dir.pwd)}/conf/cassandra.in.sh "
-    env << "CASSANDRA_HOME=#{CASSANDRA_HOME}/server "
-    env << "CASSANDRA_CONF=#{File.expand_path(Dir.pwd)}/conf"
+    env << "CASSANDRA_INCLUDE=#{File.expand_path(Dir.pwd)}/conf/#{CASSANDRA_VERSION}/cassandra.in.sh "
+    env << "CASSANDRA_HOME=#{CASSANDRA_HOME}/cassandra-#{CASSANDRA_VERSION} "
+    env << "CASSANDRA_CONF=#{File.expand_path(Dir.pwd)}/conf/#{CASSANDRA_VERSION}"
   else
     env << "CASSANDRA_INCLUDE=#{ENV['CASSANDRA_INCLUDE']} "
     env << "CASSANDRA_HOME=#{ENV['CASSANDRA_HOME']} "
     env << "CASSANDRA_CONF=#{ENV['CASSANDRA_CONF']}"
   end
 
-  Dir.chdir(File.join(CASSANDRA_HOME, 'server')) do
+  env
+end
+
+desc "Start Cassandra"
+task :cassandra => :java do
+  setup_cassandra_version
+
+  env = setup_environment
+
+  Dir.chdir(File.join(CASSANDRA_HOME, "cassandra-#{CASSANDRA_VERSION}")) do
     sh("env #{env} bin/cassandra -f")
   end
 end
 
-file File.join(CASSANDRA_HOME, 'server') => File.join(DOWNLOAD_DIR, DIST_FILE) do
-  Dir.chdir(CASSANDRA_HOME) do
-    sh "tar xzf #{File.join(DOWNLOAD_DIR, DIST_FILE)} -C #{CASSANDRA_HOME}"
-    sh "mv #{DIST_FILE.split('.')[0..2].join('.').sub('-bin', '')} server"
+desc "Run the Cassandra CLI"
+task :cli do
+  Dir.chdir(File.join(CASSANDRA_HOME, "cassandra-#{CASSANDRA_VERSION}")) do
+    sh("bin/cassandra-cli -host localhost -port 9160")
   end
-end
-
-file File.join(DOWNLOAD_DIR, DIST_FILE) => CASSANDRA_HOME do
-  puts "downloading"
-  cmd = "curl -L -o #{File.join(DOWNLOAD_DIR, DIST_FILE)} #{DIST_URL}"
-  sh cmd
 end
 
 desc "Check Java version"
@@ -67,9 +90,27 @@ namespace :data do
   desc "Reset test data"
   task :reset do
     puts "Resetting test data"
-    sh("rm -rf #{File.join(CASSANDRA_HOME, 'server', 'data')}")
+    sh("rm -rf #{File.join(CASSANDRA_HOME, "cassandra-#{CASSANDRA_VERSION}", 'data')}")
+  end
+
+  desc "Load test data structures."
+  task :load do
+    unless CASSANDRA_VERSION == '0.6'
+
+      schema_path = "#{File.expand_path(Dir.pwd)}/conf/#{CASSANDRA_VERSION}/schema.txt"
+      puts "Loading test data structures."
+      Dir.chdir(File.join(CASSANDRA_HOME, "cassandra-#{CASSANDRA_VERSION}")) do
+        begin
+          sh("bin/cassandra-cli --host localhost --batch < #{schema_path}")
+        rescue
+          puts "Schema already loaded."
+        end
+      end
+    end
   end
 end
+
+task :test => 'data:load'
 
 # desc "Regenerate thrift bindings for Cassandra" # Dev only
 task :thrift do

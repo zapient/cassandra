@@ -1,9 +1,5 @@
 require File.expand_path(File.dirname(__FILE__) + '/test_helper')
 
-def cassandra07?
-  CassandraThrift::VERSION != '2.1.0'
-end
-
 class CassandraTest < Test::Unit::TestCase
   include Cassandra::Constants
 
@@ -47,7 +43,7 @@ class CassandraTest < Test::Unit::TestCase
     hash = OrderedHash['b', '', 'c', '', 'd', '', 'a', '']
     @twitter.insert(:Users, key, hash)
     assert_equal(hash.keys.sort, @twitter.get(:Users, key).keys)
-    assert_equal(hash.timestamps.keys.sort, @twitter.get(:Users, key).timestamps.keys.sort)
+    assert_equal(hash.timestamps.keys.sort, @twitter.get(:Users, key).timestamps.keys)
     assert_not_equal(hash.keys, @twitter.get(:Users, key).keys)
   end
 
@@ -107,15 +103,17 @@ class CassandraTest < Test::Unit::TestCase
   end
 
   def test_get_value_with_range
+    k = key
+
     10.times do |i|
-      @twitter.insert(:Statuses, key, {"body-#{i}" => 'v'})
+      @twitter.insert(:Statuses, k, {"body-#{i}" => 'v'})
     end
 
-    assert_equal 5, @twitter.get(:Statuses, key, :count => 5).length
-    assert_equal 5, @twitter.get(:Statuses, key, :start => "body-5").length
-    assert_equal 5, @twitter.get(:Statuses, key, :finish => "body-4").length
-    assert_equal 5, @twitter.get(:Statuses, key, :start => "body-1", :count => 5).length
-    assert_equal 5, @twitter.get(:Statuses, key, :start => "body-0", :finish => "body-4", :count => 7).length
+    assert_equal 5, @twitter.get(:Statuses, k, :count => 5).length
+    assert_equal 5, @twitter.get(:Statuses, k, :start => "body-5").length
+    assert_equal 5, @twitter.get(:Statuses, k, :finish => "body-4").length
+    assert_equal 5, @twitter.get(:Statuses, k, :start => "body-1", :count => 5).length
+    assert_equal 5, @twitter.get(:Statuses, k, :start => "body-0", :finish => "body-4", :count => 7).length
   end
 
   def test_exists_with_only_key
@@ -133,8 +131,9 @@ class CassandraTest < Test::Unit::TestCase
 
   def test_get_several_super_keys
     columns = {
-      'user_timelines' => {@uuids[1]  => 'v1'},
-      'mentions_timelines' => {@uuids[2]  => 'v2'}}
+      'mentions_timelines' => {@uuids[2]  => 'v2'},
+      'user_timelines' => {@uuids[1]  => 'v1'}}
+
     @twitter.insert(:StatusRelationships, key, columns)
 
     assert_equal(columns, @twitter.get(:StatusRelationships, key))
@@ -191,24 +190,79 @@ class CassandraTest < Test::Unit::TestCase
     assert_nil @twitter.get(:StatusRelationships, 'bogus', 'user_timelines', columns.keys.first)
   end
 
+  def test_get_range_with_key_range
+    skip('This test requires the use of OrderPreservingPartitioner on the cluster to work properly.')
+    k = key
+    @twitter.insert(:Statuses, k + '2', {'body' => '1'})
+    @twitter.insert(:Statuses, k + '3', {'body' => '1'})
+    @twitter.insert(:Statuses, k + '4', {'body' => '1'})
+    @twitter.insert(:Statuses, k + '5', {'body' => '1'})
+    @twitter.insert(:Statuses, k + '6', {'body' => '1'})
+    assert_equal([k + '3', k + '4', k + '5'], @twitter.get_range(:Statuses, :start_key => k + '3', :finish_key => k + '5').keys)
+  end
 
-  #TODO: add a OPP keyspace for this
-  # def test_get_range
-  #   @twitter.insert(:Statuses, '2', {'body' => '1'})
-  #   @twitter.insert(:Statuses, '3', {'body' => '1'})
-  #   @twitter.insert(:Statuses, '4', {'body' => '1'})
-  #   @twitter.insert(:Statuses, '5', {'body' => '1'})
-  #   @twitter.insert(:Statuses, '6', {'body' => '1'})
-  #   assert_equal(['3', '4', '5'], @twitter.get_range(:Statuses, :start => '3', :finish => '5'))
-  # end
+  def test_get_range
+    # make sure that deleted rows are not included in the iteration
+    10.times do |i|
+      @twitter.insert(:Statuses, i.to_s, {'body' => '1'})
+      @twitter.insert(:Statuses, i.to_s + '_delete_me', {'test' => 'value'})
+      @twitter.remove(:Statuses, i.to_s + '_delete_me')
+    end
 
-  def test_get_range_count
-     @twitter.insert(:Statuses, '2', {'body' => '1'})
-     @twitter.insert(:Statuses, '3', {'body' => '1'})
-     @twitter.insert(:Statuses, '4', {'body' => '1'})
-     @twitter.insert(:Statuses, '5', {'body' => '1'})
-     @twitter.insert(:Statuses, '6', {'body' => '1'})
-     assert_equal(3, @twitter.get_range(:Statuses, :count => 3).size)
+    assert_equal(4, @twitter.get_range_keys(:Statuses, :key_count => 4).size)
+  end
+
+  def test_each_key
+    k = key
+    keys_yielded = []
+
+    10.times do |i|
+      @twitter.insert(:Statuses, k + i.to_s, {"body-#{i.to_s}" => 'v'})
+    end
+
+    # make sure that deleted rows are not included in the iteration
+    @twitter.insert(:Statuses, k + '_delete_me', {'test' => 'value'})
+    @twitter.remove(:Statuses, k + '_delete_me')
+
+    @twitter.each_key(:Statuses) do |key|
+      keys_yielded << key
+    end
+
+    assert_equal 10, keys_yielded.length
+  end
+
+  def test_each
+    k = key
+    key_columns  = {}
+
+    10.times do |i|
+      key_columns[k + i.to_s]   = {"body-#{i.to_s}" => 'v', 'single_column_lookup' => "value = #{i.to_s}"}
+      @twitter.insert(:Statuses, k + i.to_s, key_columns[k + i.to_s])
+    end
+
+    keys_yielded = []
+    @twitter.each(:Statuses, :batch_size => 5) do |key, columns|
+      assert_equal key_columns[key], columns
+      keys_yielded << key
+    end
+
+    assert_equal 10, keys_yielded.length
+
+    keys_yielded = []
+    @twitter.each(:Statuses, :key_count => 7, :batch_size => 5) do |key, columns|
+      assert_equal key_columns[key], columns
+      keys_yielded << key
+    end
+
+    assert_equal 7, keys_yielded.length, 'each limits to specified count'
+
+    keys_yielded = []
+    @twitter.each(:Statuses, :columns => ['single_column_lookup'], :batch_size => 5) do |key, columns|
+      assert_equal key_columns[key].reject {|k,v| k != 'single_column_lookup'}, columns
+      keys_yielded << key
+    end
+
+    assert_equal 10, keys_yielded.length
   end
 
   def test_multi_get
@@ -234,6 +288,13 @@ class CassandraTest < Test::Unit::TestCase
 
     @twitter.remove(:Statuses, key)
     assert_equal({}, @twitter.get(:Statuses, key))
+  end
+
+  def test_remove_super_sub_key_errors_for_normal_column_family
+    @twitter.insert(:Statuses, key, {'body' => 'v'})
+    assert_equal({'body' => 'v'}, @twitter.get(:Statuses, key))
+
+    assert_raise( ArgumentError) { @twitter.remove(:Statuses, key, 'body' , 'subcolumn') }
   end
 
   def test_remove_value
@@ -323,9 +384,10 @@ class CassandraTest < Test::Unit::TestCase
   end
 
   def test_count_keys
-    @twitter.insert(:Statuses, key + "1", {'body' => '1'})
-    @twitter.insert(:Statuses, key + "2", {'body' => '2'})
-    @twitter.insert(:Statuses, key + "3", {'body' => '3'})
+    k = key
+    @twitter.insert(:Statuses, k + "1", {'body' => '1'})
+    @twitter.insert(:Statuses, k + "2", {'body' => '2'})
+    @twitter.insert(:Statuses, k + "3", {'body' => '3'})
     assert_equal 3, @twitter.count_range(:Statuses)
   end
 
@@ -360,6 +422,7 @@ class CassandraTest < Test::Unit::TestCase
   def test_batch_mutate
     k = key
 
+    @twitter.insert(:Users, k + '0', {'delete_me' => 'v0', 'keep_me' => 'v0'})
     @twitter.insert(:Users, k + '1', {'body' => 'v1', 'user' => 'v1'})
     initial_subcolumns = {@uuids[1] => 'v1', @uuids[2] => 'v2'}
     @twitter.insert(:StatusRelationships, k, {'user_timelines' => initial_subcolumns, 'dummy_supercolumn' => {@uuids[5] => 'value'}})
@@ -369,18 +432,23 @@ class CassandraTest < Test::Unit::TestCase
     subcolumn_to_delete = initial_subcolumns.keys.first # the first column of the initial set
 
     @twitter.batch do
+      # Normal Columns
       @twitter.insert(:Users, k + '2', {'body' => 'v2', 'user' => 'v2'})
       @twitter.insert(:Users, k + '3', {'body' => 'bogus', 'user' => 'v3'})
       @twitter.insert(:Users, k + '3', {'body' => 'v3', 'location' => 'v3'})
       @twitter.insert(:Statuses, k + '3', {'body' => 'v'})
 
+      assert_equal({'delete_me' => 'v0', 'keep_me' => 'v0'}, @twitter.get(:Users, k + '0')) # Written
       assert_equal({'body' => 'v1', 'user' => 'v1'}, @twitter.get(:Users, k + '1')) # Written
       assert_equal({}, @twitter.get(:Users, k + '2')) # Not yet written
       assert_equal({}, @twitter.get(:Statuses, k + '3')) # Not yet written
 
-      @twitter.remove(:Users, k + '1')
+      @twitter.remove(:Users, k + '1') # Full row 
       assert_equal({'body' => 'v1', 'user' => 'v1'}, @twitter.get(:Users, k + '1')) # Not yet removed
 
+      @twitter.remove(:Users, k +'0', 'delete_me') # A single column of the row
+      assert_equal({'delete_me' => 'v0', 'keep_me' => 'v0'}, @twitter.get(:Users, k + '0')) # Not yet removed
+      
       @twitter.remove(:Users, k + '4')
       @twitter.insert(:Users, k + '4', {'body' => 'v4', 'user' => 'v4'})
       assert_equal({}, @twitter.get(:Users, k + '4')) # Not yet written
@@ -400,6 +468,9 @@ class CassandraTest < Test::Unit::TestCase
     assert_equal({'body' => 'v4', 'user' => 'v4'}, @twitter.get(:Users, k + '4')) # Written
     assert_equal({'body' => 'v'}, @twitter.get(:Statuses, k + '3')) # Written
     assert_equal({}, @twitter.get(:Users, k + '1')) # Removed
+    
+    assert_equal({ 'keep_me' => 'v0'}, @twitter.get(:Users, k + '0')) # 'delete_me' column removed
+    
 
     assert_equal({'body' => 'v2', 'user' => 'v2'}.keys.sort, @twitter.get(:Users, k + '2').timestamps.keys.sort) # Written
     assert_equal({'body' => 'v3', 'user' => 'v3', 'location' => 'v3'}.keys.sort, @twitter.get(:Users, k + '3').timestamps.keys.sort) # Written and compacted
@@ -442,7 +513,18 @@ class CassandraTest < Test::Unit::TestCase
     @twitter.insert(:Statuses, key, { 'body' => '1' })
   end
 
-  if cassandra07?
+  def test_batch_over_deletes
+    k = key
+
+    @twitter.batch do
+      @twitter.insert(:Users, k, {'body' => 'body', 'user' => 'user'})
+      @twitter.remove(:Users, k, 'body')
+    end
+
+    assert_equal({'user' => 'user'}, @twitter.get(:Users, k))
+  end
+
+  if CASSANDRA_VERSION.to_f >= 0.7
     def test_creating_and_dropping_new_index
       @twitter.create_index('Twitter', 'Statuses', 'column_name', 'LongType')
       assert_nil @twitter.create_index('Twitter', 'Statuses', 'column_name', 'LongType')
@@ -466,7 +548,7 @@ class CassandraTest < Test::Unit::TestCase
 
       indexed_row = @twitter.get_indexed_slices(:Statuses, idx_clause)
       assert_equal(1,      indexed_row.length)
-      assert_equal('row2', indexed_row.first.key)
+      assert_equal('row2', indexed_row.keys.first)
     end
   end
 

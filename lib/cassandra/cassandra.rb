@@ -30,7 +30,7 @@ For write methods, valid option parameters are:
 
 For the initial client instantiation, you may also pass in <tt>:thrift_client<tt> with a ThriftClient subclass attached. On connection, that class will be used instead of the default ThriftClient class, allowing you to add additional behavior to the connection (e.g. query logging).
 
-=end rdoc
+=end
 
 class Cassandra
   include Columns
@@ -146,9 +146,9 @@ class Cassandra
       mutation_map = 
         {
           key => {
-            column_family => [ _delete_mutation(column_family , is_super(column_family)? column : nil , sub_column , options[:timestamp]|| Time.stamp) ]
+            column_family => [ _delete_mutation(column_family, column, sub_column, options[:timestamp]|| Time.stamp) ]
           }
-        }  
+        }
       @batch << [mutation_map, options[:consistency]]
     else 
       # Let's continue using the 'remove' thrift method...not sure about the implications/performance of using the mutate instead
@@ -226,21 +226,120 @@ class Cassandra
     end
   end
 
-  # Return a list of keys in the column_family you request. Only works well if
+  # Return an OrderedHash containing the columns specified for the given
+  # range of keys in the column_family you request. Only works well if
   # the table is partitioned with OrderPreservingPartitioner. Supports the
-  # <tt>:count</tt>, <tt>:start</tt>, <tt>:finish</tt>, and <tt>:consistency</tt>
-  # options.
+  # <tt>:key_count</tt>, <tt>:start_key</tt>, <tt>:finish_key</tt>,
+  # <tt>:columns</tt>, <tt>:start</tt>, <tt>:finish</tt>, <tt>:count</tt>,
+  # and <tt>:consistency</tt> options. Please note that Cassandra returns
+  # a row for each row that has existed in the system since gc_grace_seconds.
+  # This is because deleted row keys are marked as deleted, but left in the
+  # system until the cluster has had resonable time to replicate the deletion.
+  # This function attempts to suppress deleted rows (actually any row returned without
+  # columns is suppressed).
   def get_range(column_family, options = {})
-    column_family, _, _, options = 
-      extract_and_validate_params(column_family, "", [options], READ_DEFAULTS)
-    _get_range(column_family, options[:start].to_s, options[:finish].to_s, options[:count], options[:consistency])
+    if block_given? || options[:key_count] || options[:batch_size]
+      get_range_batch(column_family, options)
+    else
+      get_range_single(column_family, options)
+    end
   end
 
-  # Count all rows in the column_family you request. Requires the table
-  # to be partitioned with OrderPreservingHash. Supports the <tt>:start</tt>,
-  # <tt>:finish</tt>, and <tt>:consistency</tt> options.
+  def get_range_single(column_family, options = {})
+    return_empty_rows = options.delete(:return_empty_rows) || false
+
+    column_family, _, _, options = 
+      extract_and_validate_params(column_family, "", [options], 
+                                  READ_DEFAULTS.merge(:start_key  => '',
+                                                      :end_key    => '',
+                                                      :key_count  => 100,
+                                                      :columns    => nil
+                                                     )
+                                 )
+
+    results = _get_range( column_family,
+                          options[:start_key].to_s,
+                          options[:finish_key].to_s,
+                          options[:key_count],
+                          options[:columns],
+                          options[:start].to_s,
+                          options[:finish].to_s,
+                          options[:count],
+                          options[:consistency] )
+
+    multi_key_slices_to_hash(column_family, results, return_empty_rows)
+  end
+
+  def get_range_batch(column_family, options = {})
+    batch_size    = options.delete(:batch_size) || 100
+    count         = options.delete(:key_count)
+    result        = {}
+
+    options[:start_key] ||= ''
+    last_key  = nil
+
+    while options[:start_key] != last_key && (count.nil? || count > result.length)
+      options[:start_key] = last_key
+      res = get_range_single(column_family, options.merge!(:start_key => last_key,
+                                                           :key_count => batch_size,
+                                                           :return_empty_rows => true
+                                                          ))
+      res.each do |key, columns|
+        next if options[:start_key] == key
+        next if result.length == count
+
+        unless columns == {}
+          yield key, columns if block_given?
+          result[key] = columns
+        end
+        last_key = key
+      end
+    end
+
+    result
+  end
+
+  # Count all rows in the column_family you request. Supports the <tt>:start_key</tt>,
+  # <tt>:finish_key</tt>, and <tt>:consistency</tt> options.  Please note that 
+  # <tt>:start_key</tt> and <tt>:finish_key</tt> only work properly when
+  # OrderPreservingPartitioner.
   def count_range(column_family, options = {})
-    get_range(column_family, options).select{|r| r.columns.length > 0}.compact.length
+    get_range_keys(column_family, options).length
+  end
+
+  # Return an Array containing all of the keys within a given range. (Only works
+  # properly if the Cassandra cluster is using the OrderPreservingPartitioner.)
+  # Supports <tt>:start_key</tt>, <tt>:finish_key</tt>, <tt>:count</tt>, and
+  # <tt>:consistency</tt> options.
+  def get_range_keys(column_family, options = {})
+    get_range(column_family,options.merge!(:count => 1)).keys
+  end
+
+  # Iterate through each key within the given parameters. This function can be
+  # used to iterate over each key in the given column family. However, if you
+  # only want to walk through a range of keys you need to have your cluster
+  # setup with OrderPreservingPartitioner. Please note that this function walks
+  # the list of keys in batches using the passed in <tt>:count</tt> option.
+  # Supports <tt>:start_key</tt>, <tt>:finish_key</tt>, <tt>:count</tt>, and
+  # <tt>:consistency</tt> options.
+  def each_key(column_family, options = {})
+    get_range_batch(column_family, options) do |key, columns|
+      yield key
+    end
+  end
+
+  # Iterate through each row and yields each key and value within the given parameters.
+  # This function can be used to iterate over each key in the given column family.
+  # However, if you only want to walk through a range of keys you need to have your
+  # cluster setup with OrderPreservingPartitioner. Please note that this function walks
+  # the list of keys in batches using the passed in <tt>:count</tt> option.
+  # Supports the <tt>:key_count</tt>, <tt>:start_key</tt>, <tt>:finish_key</tt>,
+  # <tt>:columns</tt>, <tt>:start</tt>, <tt>:finish</tt>, <tt>:count</tt>,
+  # and <tt>:consistency</tt> options.
+  def each(column_family, options = {})
+    get_range_batch(column_family, options) do |key, columns|
+      yield key, columns
+    end
   end
 
   # Open a batch operation and yield self. Inserts and deletes will be queued
@@ -276,7 +375,7 @@ class Cassandra
   # Roll up queued mutations, to improve atomicity (and performance).
   def compact_mutations!
     used_clevels = {} # hash that lists the consistency levels seen in the batch array. key is the clevel, value is true
-    by_key = {}
+    by_key = Hash.new{|h,k | h[k] = {}}
     # @batch is an array of mutation_ops.
     # A mutation op is a 2-item array containing [mutationmap, consistency_number]
     # a mutation map is a hash, by key (string) that has a hash by CF name, containing a list of column_mutations)
@@ -291,18 +390,13 @@ class Cassandra
       #      }, # [0]
       #  consistency # [1] 
       #]
-      # For a remove:
-      # [  :remove,  # [0]
-      #    [key, CassThrift:ColPath, timestamp, consistency ]  # [1]
-      # ]
       mmap = mutation_op[0] # :remove OR a hash like {"key"=> {"CF"=>[mutationclass1,...] } }
-      used_clevels[mutation_op[1]]=true #save the clevel required for this operation
+      used_clevels[mutation_op[1]] = true #save the clevel required for this operation
 
       mmap.keys.each do |k|
-        by_key[k] = {} unless by_key.has_key? k #make sure the key exists
         mmap[k].keys.each do |cf| # For each CF in that key
-          by_key[k][cf] = [] unless by_key[k][cf] != nil
-          by_key[k][cf].concat mmap[k][cf] # Append the list of mutations for that key and CF
+          by_key[k][cf] ||= []
+          by_key[k][cf].concat(mmap[k][cf]) # Append the list of mutations for that key and CF
         end
       end
     end
